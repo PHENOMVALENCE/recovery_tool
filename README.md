@@ -54,7 +54,24 @@ pip install -r requirements.txt
 
 ## 📖 Usage
 
-### Basic Syntax
+### GUI Interface (Recommended)
+
+Launch the graphical user interface:
+
+```bash
+python recover_gui.py
+```
+
+The GUI provides:
+- Visual file browser for selecting disk images and output folders
+- Checkboxes for file type selection (PDF, DOCX, JPG)
+- Real-time progress bar
+- Live console log showing recovered files with hex offsets and hashes
+- Thread-safe operation (GUI remains responsive during scanning)
+
+### CLI Interface
+
+#### Basic Syntax
 
 ```bash
 python recover.py scan --image <disk_image> --output <output_dir> [OPTIONS]
