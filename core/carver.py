@@ -6,12 +6,13 @@ Scans raw disk images byte-by-byte to recover deleted files.
 """
 
 import os
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from pathlib import Path
 
 from .signatures import FileSignature, get_signatures_by_types
 from .hasher import compute_sha256
 from .verifier import verify_office_file, relabel_unverified_office
+from .metadata import extract_original_filename
 
 
 class FileCarver:
@@ -41,7 +42,10 @@ class FileCarver:
         self.logger = logger
         self.chunk_size = chunk_size
         self.recovered_count = 0
+        self.unique_count = 0
+        self.duplicate_count = 0
         self.processed_bytes = 0
+        self.seen_hashes: Set[str] = set()  # Track unique files by hash
         
         # Create output subdirectories
         self._create_output_directories()
@@ -82,16 +86,22 @@ class FileCarver:
     def _save_recovered_file(self, 
                             file_data: bytes,
                             file_type: str,
-                            offset: int) -> str:
+                            offset: int,
+                            original_filename: Optional[str] = None,
+                            is_duplicate: bool = False) -> str:
         """
-        Save recovered file to disk with forensic naming convention.
+        Save recovered file to disk with original filename if available.
         
-        Naming format: {file_type}_offset_{hex_offset}.{ext}
+        Naming priority:
+        1. Original filename from metadata (if available)
+        2. {file_type}_offset_{hex_offset}.{ext} (forensic naming)
         
         Args:
             file_data: Binary file data
             file_type: Type of file
             offset: Original offset in disk image
+            original_filename: Original filename extracted from metadata
+            is_duplicate: Whether this is a duplicate file
         
         Returns:
             Path to saved file
@@ -108,13 +118,34 @@ class FileCarver:
             extension = 'png'
         
         subdir = self._get_output_subdir(file_type)
-        filename = f"{file_type}_offset_{offset_hex}.{extension}"
+        
+        # Try to use original filename
+        if original_filename and not is_duplicate:
+            # Ensure extension matches
+            if not original_filename.lower().endswith(f'.{extension}'):
+                filename = f"{original_filename}.{extension}"
+            else:
+                filename = original_filename
+        else:
+            # Use forensic naming
+            if is_duplicate:
+                filename = f"{file_type}_offset_{offset_hex}_duplicate.{extension}"
+            else:
+                filename = f"{file_type}_offset_{offset_hex}.{extension}"
+        
         file_path = subdir / filename
         
         # Handle filename conflicts
         counter = 1
+        base_path = file_path
         while file_path.exists():
-            filename = f"{file_type}_offset_{offset_hex}_{counter}.{extension}"
+            if original_filename and not is_duplicate:
+                # Add counter to original filename
+                stem = base_path.stem
+                filename = f"{stem}_{counter}{base_path.suffix}"
+            else:
+                # Add counter to forensic name
+                filename = f"{file_type}_offset_{offset_hex}_{counter}.{extension}"
             file_path = subdir / filename
             counter += 1
         
@@ -236,6 +267,169 @@ class FileCarver:
         else:
             return self._extract_file_without_trailer(image_data, signature, header_offset)
     
+    def carve_folder(self,
+                    folder_path: str,
+                    progress_callback=None) -> Dict[str, int]:
+        """
+        Perform file carving on folder (scan all files for embedded signatures).
+        
+        Scans all files in folder and subdirectories, looking for file signatures
+        that may be embedded within other files or in unallocated space.
+        
+        Args:
+            folder_path: Path to folder to scan
+            progress_callback: Optional callback function(files_processed, total_files)
+        
+        Returns:
+            Dictionary with recovery statistics
+        """
+        folder = Path(folder_path)
+        if not folder.exists() or not folder.is_dir():
+            raise ValueError(f"Folder does not exist or is not a directory: {folder_path}")
+        
+        # Collect all files
+        all_files = []
+        for root, dirs, files in os.walk(folder):
+            # Skip hidden/system directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for filename in files:
+                file_path = Path(root) / filename
+                try:
+                    if file_path.is_file():
+                        all_files.append(file_path)
+                except (OSError, PermissionError):
+                    continue
+        
+        total_files = len(all_files)
+        self.processed_bytes = 0
+        self.recovered_count = 0
+        
+        # Track found files to prevent duplicates
+        found_files: List[Tuple[str, int, FileSignature]] = []  # (file_path, offset, signature)
+        
+        # Scan each file
+        for file_idx, file_path in enumerate(all_files):
+            try:
+                file_size = file_path.stat().st_size
+                if file_size == 0:
+                    continue
+                
+                # Read file in chunks
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+                
+                # Check if file starts with any known signature (normal file matching)
+                file_matched = False
+                for file_type, signature in self.signatures.items():
+                    if file_data.startswith(signature.header):
+                        # File starts with signature - this is a normal file of this type
+                        found_files.append((str(file_path), 0, signature))
+                        file_matched = True
+                        break
+                
+                # Also scan for embedded signatures (files within files)
+                if not file_matched or True:  # Always scan for embedded files too
+                    for file_type, signature in self.signatures.items():
+                        offset = 1  # Start after position 0 (already checked)
+                        while True:
+                            pos = file_data.find(signature.header, offset)
+                            if pos == -1:
+                                break
+                            
+                            # This is an embedded file (not at start)
+                            # Check for overlap
+                            is_overlap = False
+                            for found_path, found_offset, found_sig in found_files:
+                                if found_path == str(file_path) and abs(pos - found_offset) < found_sig.header_length:
+                                    is_overlap = True
+                                    break
+                            
+                            if not is_overlap:
+                                found_files.append((str(file_path), pos, signature))
+                            
+                            offset = pos + 1
+                
+                self.processed_bytes += file_size
+                
+                if progress_callback:
+                    progress_callback(file_idx + 1, total_files)
+            
+            except (IOError, OSError, PermissionError):
+                continue
+        
+        # Extract and save all found files
+        for source_path, header_offset, signature in found_files:
+            try:
+                with open(source_path, 'rb') as f:
+                    file_data = f.read()
+                
+                extracted_data = self._extract_file(file_data, signature, header_offset)
+                
+                if extracted_data is None:
+                    continue
+                
+                # Verify and potentially relabel
+                file_type = signature.file_type
+                is_verified, verification_status = verify_office_file(extracted_data, file_type)
+                
+                if not is_verified and verification_status == 'unverified':
+                    file_type = relabel_unverified_office(file_type, verification_status)
+                
+                # Compute hash for duplicate detection
+                sha256_hash = compute_sha256(extracted_data)
+                
+                # Check for duplicates
+                is_duplicate = sha256_hash in self.seen_hashes
+                if not is_duplicate:
+                    self.seen_hashes.add(sha256_hash)
+                    self.unique_count += 1
+                else:
+                    self.duplicate_count += 1
+                
+                # Try to extract original filename
+                original_filename = None
+                if not is_duplicate:
+                    original_filename = extract_original_filename(extracted_data, file_type)
+                
+                # Generate offset based on source file and position
+                source_name = Path(source_path).stem
+                offset_hex = f'0x{header_offset:X}'
+                virtual_offset = hash(source_path) + header_offset  # Virtual offset for logging
+                
+                # Save file
+                saved_path = self._save_recovered_file(
+                    extracted_data,
+                    file_type,
+                    virtual_offset,
+                    original_filename=original_filename,
+                    is_duplicate=is_duplicate
+                )
+                
+                # Log recovery
+                log_status = verification_status
+                if is_duplicate:
+                    log_status = f"{verification_status},duplicate"
+                
+                self.logger.log_recovery(
+                    file_type=file_type,
+                    offset_hex=f"{Path(source_path).name}:{offset_hex}",
+                    file_size=len(extracted_data),
+                    sha256=sha256_hash,
+                    verification_status=log_status
+                )
+                
+                self.recovered_count += 1
+            
+            except Exception:
+                continue
+        
+        return {
+            'total_recovered': self.recovered_count,
+            'unique_files': self.unique_count,
+            'duplicate_files': self.duplicate_count,
+            'bytes_processed': self.processed_bytes
+        }
+    
     def carve(self, 
              image_path: str,
              progress_callback=None) -> Dict[str, int]:
@@ -327,25 +521,50 @@ class FileCarver:
             if not is_verified and verification_status == 'unverified':
                 file_type = relabel_unverified_office(file_type, verification_status)
             
-            # Compute hash
+            # Compute hash for duplicate detection
             sha256_hash = compute_sha256(file_data)
             
-            # Save file
-            saved_path = self._save_recovered_file(file_data, file_type, header_offset)
+            # Check for duplicates
+            is_duplicate = sha256_hash in self.seen_hashes
+            if not is_duplicate:
+                self.seen_hashes.add(sha256_hash)
+                self.unique_count += 1
+            else:
+                self.duplicate_count += 1
             
-            # Log recovery
+            # Try to extract original filename from metadata
+            original_filename = None
+            if not is_duplicate:  # Only extract for unique files
+                original_filename = extract_original_filename(file_data, file_type)
+            
+            # Save file
+            saved_path = self._save_recovered_file(
+                file_data, 
+                file_type, 
+                header_offset,
+                original_filename=original_filename,
+                is_duplicate=is_duplicate
+            )
+            
+            # Log recovery (include duplicate status)
             offset_hex = f'0x{header_offset:X}'
+            log_status = verification_status
+            if is_duplicate:
+                log_status = f"{verification_status},duplicate"
+            
             self.logger.log_recovery(
                 file_type=file_type,
                 offset_hex=offset_hex,
                 file_size=len(file_data),
                 sha256=sha256_hash,
-                verification_status=verification_status
+                verification_status=log_status
             )
             
             self.recovered_count += 1
         
         return {
             'total_recovered': self.recovered_count,
+            'unique_files': self.unique_count,
+            'duplicate_files': self.duplicate_count,
             'bytes_processed': self.processed_bytes
         }

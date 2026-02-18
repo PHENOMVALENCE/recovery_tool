@@ -32,7 +32,8 @@ class RecoveryLogger:
         'offset_hex',
         'file_size',
         'sha256',
-        'verification_status'
+        'verification_status',
+        'is_duplicate'
     ]
     
     def __init__(self, log_file_path: str):
@@ -52,6 +53,16 @@ class RecoveryLogger:
             with open(self.log_file_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=self.CSV_COLUMNS)
                 writer.writeheader()
+        else:
+            # Check if file has old format (without is_duplicate column)
+            try:
+                with open(self.log_file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames and 'is_duplicate' not in reader.fieldnames:
+                        # Old format detected - we'll add the column when writing
+                        pass
+            except Exception:
+                pass
     
     def log_recovery(self, 
                     file_type: str,
@@ -69,9 +80,13 @@ class RecoveryLogger:
             offset_hex: Hexadecimal offset where file was found (e.g., '0x1FA340')
             file_size: Size of recovered file in bytes
             sha256: SHA-256 hash of recovered file
-            verification_status: Verification status ('verified', 'unverified', 'failed')
+            verification_status: Verification status ('verified', 'unverified', 'failed', or with ',duplicate')
         """
         timestamp = datetime.utcnow().isoformat() + 'Z'
+        
+        # Extract duplicate status from verification_status
+        is_duplicate = ',duplicate' in verification_status
+        clean_status = verification_status.replace(',duplicate', '')
         
         log_entry = {
             'timestamp': timestamp,
@@ -79,7 +94,8 @@ class RecoveryLogger:
             'offset_hex': offset_hex,
             'file_size': file_size,
             'sha256': sha256,
-            'verification_status': verification_status
+            'verification_status': clean_status,
+            'is_duplicate': 'Yes' if is_duplicate else 'No'
         }
         
         # Append-only write for forensic integrity
