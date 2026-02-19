@@ -1,0 +1,11 @@
+*.dd
+*.img
+*.e01
+*.raw
+*.iso
+__pycache__/
+*.pyc
+recovered_files/
+output*/
+new_recovery/
+testfolder/
